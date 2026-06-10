@@ -8,7 +8,6 @@ const CONFIG = {
   referenceDate: "2026-06-09",
   stations: ["梓坊", "先锋", "土桥", "渣津", "瑞昌", "萍乡", "虬津"],
   gotoTimeout: 60000,
-  pageLoadWait: 5000,
   loginUrl: "http://weixin.jxsswj.cn/jxhydp-app/#login",
   dataUrl: "http://weixin.jxsswj.cn/jxhydp-app/#hydataview",
   username: "夏雄",
@@ -16,7 +15,6 @@ const CONFIG = {
 };
 
 const OUTPUT_DIR = path.join(__dirname, "output");
-const DEBUG_DIR = path.join(__dirname, "debug");
 
 // ==================== 日期工具 ====================
 function getWeekRange(refDateStr) {
@@ -47,113 +45,90 @@ function getWeekRange(refDateStr) {
   return { monday: fmt(lastMonday), sunday: fmt(lastSunday), dates };
 }
 
-// ==================== 调试辅助 ====================
-function debugLog(page, msg) {
-  const ts = new Date().toISOString().slice(11, 19);
-  return page.evaluate((m) => { console.log(`[${m}]`); }, `${ts} ${msg}`);
-}
-
-async function debugSave(page, label) {
-  try {
-    fs.mkdirSync(DEBUG_DIR, { recursive: true });
-    const html = await page.content();
-    fs.writeFileSync(path.join(DEBUG_DIR, `${label}.html`), html);
-    await page.screenshot({ path: path.join(DEBUG_DIR, `${label}.png`), fullPage: true });
-    console.log(`  [调试] ${label}.html + ${label}.png 已保存`);
-  } catch (e) {
-    console.log(`  [调试] 保存失败: ${e.message}`);
-  }
-}
-
-// ==================== 数据提取（多策略） ====================
+// ==================== 数据提取 ====================
 async function extractStationData(page) {
-  const results = [];
-
-  // 等待可能的 AJAX 加载
-  await page.waitForTimeout(3000);
-
-  // 策略1：.x-grid-item（ExtJS 6+ 经典主题）
-  let rows1 = await page.locator(".x-grid-item").all();
-  console.log(`  [策略1] .x-grid-item: ${rows1.length} 行`);
-
-  // 策略2：.x-grid-row（旧版 ExtJS）
-  let rows2 = await page.locator(".x-grid-row").all();
-  console.log(`  [策略2] .x-grid-row: ${rows2.length} 行`);
-
-  // 策略3：table.x-grid-table（ExtJS 表格）
-  let rows3 = await page.locator("table.x-grid-table tr").all();
-  console.log(`  [策略3] table.x-grid-table tr: ${rows3.length} 行`);
-
-  // 策略4：.x-grid-view 下的所有 table tr
-  let rows4 = await page.locator(".x-grid-view table tr").all();
-  console.log(`  [策略4] .x-grid-view table tr: ${rows4.length} 行`);
-
-  // 策略5：查找所有带 data- 属性的 grid 容器
-  const dataViews = await page.locator("[data-boundview]").all();
-  console.log(`  [策略5] [data-boundview]: ${dataViews.length} 个`);
-  for (const dv of dataViews) {
-    const boundview = await dv.getAttribute("data-boundview");
-    const trCount = await dv.locator("table tr").count();
-    console.log(`    ${boundview}: ${trCount} 行`);
-  }
-
-  // 策略6：直接查所有 table，打印表头
-  const allTables = await page.locator("table").all();
-  console.log(`  [策略6] 页面共 ${allTables.length} 个 table`);
-  for (let i = 0; i < allTables.length; i++) {
-    const table = allTables[i];
-    const trs = await table.locator("tr").all();
-    if (trs.length < 2) continue;
-    // 读第一行看表头
-    const headerCells = await trs[0].locator("th, td").all();
-    const headerTexts = [];
-    for (const hc of headerCells.slice(0, 15)) {
-      headerTexts.push((await hc.textContent()).trim().substring(0, 10));
-    }
-    console.log(`    table[${i}] ${trs.length}行 表头: [${headerTexts.join(" | ")}]`);
-  }
-
-  // 策略7：检查 iframe
-  const iframes = await page.locator("iframe").all();
-  console.log(`  [策略7] iframe: ${iframes.length} 个`);
-
-  // 实际提取：优先用 .x-grid-item
-  let rows = rows1;
-  let extractor = "grid-item";
-
-  if (rows.length === 0) rows = rows3; extractor = "grid-table";
-  if (rows.length === 0) rows = rows2; extractor = "grid-row";
-  if (rows.length === 0) rows = rows4; extractor = "grid-view";
-
-  console.log(`  使用策略: ${extractor}, ${rows.length} 行`);
-
-  for (const row of rows) {
-    const cells = await row.locator(".x-grid-cell-inner, .x-grid-cell, td, th").all();
-    const texts = [];
-    for (const cell of cells) {
-      texts.push((await cell.textContent()).trim());
-    }
-    if (texts.length < 3) continue;
-
-    // 打印前3行样本
-    if (results.length < 3) {
-      console.log(`  样本行[${results.length}]: ${JSON.stringify(texts.slice(0, 10))}`);
-    }
-
-    const stationName = texts[1] || "";
-    const stationCode = texts[0] || "";
-    const riverName = texts[2] || "";
-    const dailyFlows = [];
-    for (let i = 6; i < texts.length; i++) {
-      const val = parseFloat(texts[i]);
-      if (!isNaN(val)) {
-        dailyFlows.push({ day: i - 5, flow: val });
+  // 页面是 ExtJS 构建，数据在 [data-boundview="tableview-1275"] 中
+  // 列结构（有 checkbox 列占位）:
+  //   □(0) | 行号(1) | 站码(2) | 站名(3) | 河流(4) | 月平均(5) | 月最大(6) | 月最小(7) | 1日(8) | 2日(9) | ... | 31日(38)
+  const result = await page.evaluate(() => {
+    const results = [];
+    // 目标：逐日平均流量统计的 grid view
+    const views = document.querySelectorAll("[data-boundview]");
+    let targetView = null;
+    for (const v of views) {
+      // 找包含大量列（>30列）的 view，即有1日~31日列的
+      const headers = v.querySelectorAll(".x-column-header-text-inner, .x-column-header-text");
+      if (headers.length >= 30) {
+        targetView = v;
+        break;
       }
     }
-    results.push({ stationCode, stationName, riverName, dailyFlows });
-  }
+    if (!targetView) {
+      // 回退到 tableview-1275
+      targetView = document.querySelector('[data-boundview="tableview-1275"]');
+    }
+    if (!targetView) {
+      return { results, error: "未找到数据 grid view" };
+    }
 
-  return results;
+    // 提取表头确认列索引
+    const headerEls = targetView.querySelectorAll(".x-column-header-text-inner, .x-column-header-text");
+    const headers = [];
+    for (const h of headerEls) {
+      headers.push((h.textContent || "").trim());
+    }
+    // 找到站名列和1日列的位置
+    const stationNameIdx = headers.findIndex(h => h === "站名" || h.includes("站名"));
+    const stationCodeIdx = headers.findIndex(h => h === "站码" || h.includes("站码"));
+    const riverIdx = headers.findIndex(h => h === "河流" || h.includes("河"));
+    const day1Idx = headers.findIndex(h => h === "1日" || h === "1");
+
+    // 提取数据行（跳过表头）
+    const rows = targetView.querySelectorAll(".x-grid-item");
+    for (const row of rows) {
+      const cells = row.querySelectorAll(".x-grid-cell-inner");
+      const texts = [];
+      for (const cell of cells) {
+        texts.push((cell.textContent || "").trim());
+      }
+      if (texts.length < 3) continue;
+
+      const stationCode = stationCodeIdx >= 0 ? (texts[stationCodeIdx] || "") : (texts[2] || "");
+      const stationName = stationNameIdx >= 0 ? (texts[stationNameIdx] || "") : (texts[3] || "");
+      const riverName = riverIdx >= 0 ? (texts[riverIdx] || "") : (texts[4] || "");
+
+      // 跳过无效行：站码应为纯数字
+      if (!/^\d+$/.test(stationCode)) continue;
+
+      const dailyFlows = [];
+      const startCol = day1Idx >= 0 ? day1Idx : 8;
+      for (let i = startCol; i < texts.length; i++) {
+        const val = parseFloat(texts[i]);
+        if (!isNaN(val)) {
+          dailyFlows.push({ day: i - startCol + 1, flow: val });
+        }
+      }
+
+      results.push({ stationCode, stationName, riverName, dailyFlows });
+    }
+
+    // 附赠调试信息
+    const debug = {
+      viewId: targetView.getAttribute("data-boundview"),
+      headerCount: headers.length,
+      headers: headers.slice(0, 40),
+      stationNameIdx,
+      stationCodeIdx,
+      riverIdx,
+      day1Idx,
+      rowCount: results.length,
+      firstRow: results.length > 0 ? results[0] : null,
+    };
+
+    return { results, debug };
+  });
+
+  return result;
 }
 
 // ==================== 主流程 ====================
@@ -166,7 +141,6 @@ async function extractStationData(page) {
   console.log("");
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-  fs.mkdirSync(DEBUG_DIR, { recursive: true });
 
   const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
   const context = await browser.newContext({ locale: "zh-CN", viewport: { width: 1920, height: 1080 } });
@@ -175,11 +149,12 @@ async function extractStationData(page) {
   try {
     // [1] 登录
     console.log("[1/4] 登录...");
-    await page.goto(CONFIG.loginUrl, { waitUntil: "networkidle", timeout: CONFIG.gotoTimeout });
+    await page.goto(CONFIG.loginUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.gotoTimeout });
     await page.waitForTimeout(3000);
 
-    const usernameInput = page.locator('input[name="username"]');
-    const passwordInput = page.locator('input[name="password"]');
+    // 正确的登录选择器：用户名输入框
+    const usernameInput = page.locator('input[name="username"], input[type="text"]').first();
+    const passwordInput = page.locator('input[name="password"], input[type="password"]').first();
     const loginBtn = page.locator('a:has-text("登 录"), button:has-text("登录"), button:has-text("登 录")');
 
     if (await usernameInput.count() > 0) {
@@ -196,8 +171,12 @@ async function extractStationData(page) {
 
     // [2] 进入数据视图并点击菜单
     console.log("[2/4] 进入逐日平均流量统计...");
-    await page.goto(CONFIG.dataUrl, { waitUntil: "networkidle", timeout: CONFIG.gotoTimeout });
-    await page.waitForTimeout(CONFIG.pageLoadWait);
+    await page.goto(CONFIG.dataUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.gotoTimeout });
+    await page.waitForTimeout(3000);
+
+    // 等待左侧树菜单加载
+    await page.waitForSelector(".x-treelist-item-text", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(2000);
 
     const treeItems = await page.$$(".x-treelist-item-text");
     let menuClicked = false;
@@ -212,15 +191,32 @@ async function extractStationData(page) {
     if (!menuClicked) {
       await page.locator('text="逐日平均流量统计"').first().click();
     }
-    await page.waitForTimeout(5000);
-    console.log("  ✓ 菜单已点击");
 
-    // 保存页面状态供调试
-    await debugSave(page, "page-state");
+    // 等待数据 grid 加载
+    console.log("  等待数据加载...");
+    await page.waitForTimeout(5000);
+    // 等待 .x-grid-item 出现
+    try {
+      await page.waitForSelector(".x-grid-item", { timeout: 15000 });
+    } catch (_) {
+      console.log("  ⚠ .x-grid-item 未出现，尝试继续...");
+    }
+    await page.waitForTimeout(3000);
+    console.log("  ✓ 菜单已点击");
 
     // [3] 提取站点数据
     console.log("[3/4] 提取站点数据...");
-    const allData = await extractStationData(page);
+    const { results: allData, debug } = await extractStationData(page);
+
+    if (debug) {
+      console.log(`  [调试] viewId: ${debug.viewId}, 表头: ${debug.headerCount}列`);
+      console.log(`  [调试] 站码@${debug.stationCodeIdx}, 站名@${debug.stationNameIdx}, 河流@${debug.riverIdx}, 1日@${debug.day1Idx}`);
+      console.log(`  [调试] 表头: ${(debug.headers || []).join(" | ")}`);
+      if (debug.firstRow) {
+        console.log(`  [调试] 首行: ${debug.firstRow.stationCode} ${debug.firstRow.stationName} 流量${debug.firstRow.dailyFlows.length}天`);
+      }
+    }
+
     console.log(`  共提取 ${allData.length} 条记录`);
 
     // 建立站名索引
@@ -230,9 +226,8 @@ async function extractStationData(page) {
     }
     console.log(`  共 ${stationMap.size} 个不同站点`);
 
-    // 打印可用站名
     if (stationMap.size > 0) {
-      console.log(`  可用站名: ${[...stationMap.keys()].slice(0, 20).join(", ")}`);
+      console.log(`  可用站名(前20): ${[...stationMap.keys()].slice(0, 20).join(", ")}`);
     }
 
     // [4] 匹配站点 & 计算周总量 & 导出 Excel
@@ -266,8 +261,7 @@ async function extractStationData(page) {
 
     if (results.length === 0) {
       console.log("\n⚠ 未匹配到任何站点。");
-      console.log("  请查看 debug/page-state.html 分析页面结构。");
-      console.log("  如果页面有筛选条件（如日期、管理单位），可能需要先设置。");
+      console.log("  请对比上面输出的「可用站名」和 CONFIG.stations。");
       return;
     }
 
