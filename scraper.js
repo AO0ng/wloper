@@ -6,7 +6,6 @@ const fs = require("fs");
 // ==================== 配置区 ====================
 const CONFIG = {
   referenceDate: "2026-06-09",
-  stationTypes: ["基本站", "非基本站"],
   stations: ["梓坊", "先锋", "土桥", "渣津", "瑞昌", "萍乡", "虬津"],
   gotoTimeout: 60000,
   pageLoadWait: 5000,
@@ -47,78 +46,37 @@ function getWeekRange(refDateStr) {
   return { monday: fmt(lastMonday), sunday: fmt(lastSunday), dates };
 }
 
-// ==================== 日期选择器辅助 ====================
-async function pickDate(page, year, month) {
-  const datePicker = page.locator(".x-datepicker, .x-panel, input[type=\"text\"]").first();
-  const monthMap = { 1: "一月", 2: "二月", 3: "三月", 4: "四月", 5: "五月", 6: "六月", 7: "七月", 8: "八月", 9: "九月", 10: "十月", 11: "十一月", 12: "十二月" };
-
-  const targetMonthLabel = monthMap[month];
-  const prevBtn = page.locator(".x-datepicker-prev, [data-ref=\"btnPrev\"], button:has-text(\"‹\"), button:has-text(\"＜\")").first();
-  const nextBtn = page.locator(".x-datepicker-next, [data-ref=\"btnNext\"], button:has-text(\"›\"), button:has-text(\"＞\")").first();
-  const monthLabel = page.locator(".x-datepicker-month .x-btn-text, .x-datepicker-month button").first();
-
-  await page.waitForTimeout(2000);
-
-  let attempts = 0;
-  let currentLabel = "";
-  while (attempts < 24) {
-    try { currentLabel = (await monthLabel.textContent({ timeout: 2000 })).trim(); } catch (_) { currentLabel = ""; }
-    if (currentLabel.includes(targetMonthLabel)) break;
-
-    const refDate = new Date(year, month - 1, 1);
-    const nowLabel = currentLabel;
-    const tryPrev = await prevBtn.count();
-    const tryNext = await nextBtn.count();
-
-    if (tryPrev > 0) {
-      await prevBtn.click();
-    } else if (tryNext > 0) {
-      await nextBtn.click();
-    } else {
-      break;
-    }
-    await page.waitForTimeout(1500);
-    attempts++;
-  }
-
-  const dayBtns = page.locator(".x-datepicker-date .x-btn:not(.x-btn-disabled), .x-datepicker-cell:not(.x-datepicker-disabled)");
-  const count = await dayBtns.count();
-  for (let i = 0; i < count; i++) {
-    const text = (await dayBtns.nth(i).textContent()).trim();
-    if (text === String(1)) {
-      await dayBtns.nth(i).click();
-      await page.waitForTimeout(2000);
-      return;
-    }
-  }
-}
-
 // ==================== 表格提取 ====================
-async function extractDailyFlowTable(page) {
-  const tables = await page.$$("table");
-  const rows = [];
+async function extractStationData(page) {
+  // ExtJS grid: 页面使用 ExtJS 组件，数据在 .x-grid-item 中，不是标准 <table>
+  const rows = await page.locator(".x-grid-item").all();
+  console.log(`  找到 ${rows.length} 个 grid 行`);
 
-  for (const table of tables) {
-    const trs = await table.$$("tr");
-    if (trs.length < 2) continue;
-
-    const headers = [];
-    const headerCells = await trs[0].$$("th, td");
-    for (const cell of headerCells) {
-      headers.push((await cell.textContent()).trim().replace(/\s+/g, ""));
+  const results = [];
+  for (const row of rows) {
+    const cells = await row.locator(".x-grid-cell-inner").all();
+    const texts = [];
+    for (const cell of cells) {
+      texts.push((await cell.textContent()).trim());
     }
-
-    for (let i = 1; i < trs.length; i++) {
-      const cells = await trs[i].$$("th, td");
-      const row = {};
-      for (let j = 0; j < cells.length; j++) {
-        row[headers[j] || `__col${j}`] = (await cells[j].textContent()).trim();
+    // 跳过空行和表头行
+    if (texts.length < 3) continue;
+    // 列: 站码(0) | 站名(1) | 河流(2) | 月平均(3) | 月最大(4) | 月最小(5) | 1日(6) | 2日(7) | ... | 31日(36)
+    const stationName = texts[1];
+    const stationCode = texts[0];
+    const riverName = texts[2];
+    const dailyFlows = [];
+    // 1日~31日在索引 6~36
+    for (let i = 6; i < texts.length; i++) {
+      const val = parseFloat(texts[i]);
+      if (!isNaN(val)) {
+        dailyFlows.push({ day: i - 5, flow: val });
       }
-      if (Object.keys(row).length > 0) rows.push(row);
     }
+    results.push({ stationCode, stationName, riverName, dailyFlows });
   }
 
-  return rows;
+  return results;
 }
 
 // ==================== 主流程 ====================
@@ -179,42 +137,19 @@ async function extractDailyFlowTable(page) {
     await page.waitForTimeout(5000);
     console.log("  ✓ 菜单已点击");
 
-    // [3] 遍历站类提取数据
+    // [3] 提取站点数据（不区分基本站/非基本站）
     console.log("[3/4] 提取站点数据...");
+    const allData = await extractStationData(page);
+    console.log(`  共 ${allData.length} 条记录`);
+
+    // 建立站名索引
     const stationMap = new Map();
-
-    for (const stationType of CONFIG.stationTypes) {
-      console.log(`  切换站类: ${stationType}`);
-
-      try {
-        const typeTabs = page.locator(`text="${stationType}"`);
-        if (await typeTabs.count() > 0) {
-          await typeTabs.first().click();
-          await page.waitForTimeout(4000);
-        }
-      } catch (_) { /* 可能已经在正确页面 */ }
-
-      const rows = await extractDailyFlowTable(page);
-      console.log(`  找到 ${rows.length} 条记录`);
-
-      for (const row of rows) {
-        const stationName = row["站名"] || row["站  名"] || row["测站名称"] || "";
-        const stationCode = row["站码"] || row["站  码"] || row["测站编码"] || "";
-        if (!stationName) continue;
-
-        const dailyFlows = [];
-        for (const key of Object.keys(row)) {
-          const val = parseFloat(row[key]);
-          if (!isNaN(val) && /^\d/.test(key)) dailyFlows.push({ date: key, flow: val });
-        }
-
-        stationMap.set(stationName, { stationCode, stationName, stationType, dailyFlows, raw: row });
-      }
+    for (const data of allData) {
+      if (data.stationName) stationMap.set(data.stationName, data);
     }
-
     console.log(`  共 ${stationMap.size} 个不同站点`);
 
-    // [4] 匹配目标站点 & 计算周总量 & 导出 Excel
+    // [4] 匹配站点 & 计算周总量 & 导出 Excel
     console.log("[4/4] 匹配站点、计算周总量...");
     const results = [];
 
@@ -227,8 +162,7 @@ async function extractDailyFlowTable(page) {
         const row = {
           站码: data.stationCode,
           站名: data.stationName,
-          河流: data.raw["河流"] || data.raw["河名"] || "",
-          站类: data.stationType,
+          河流: data.riverName,
           七日合计: Math.round(flowSum * 100) / 100,
           周总量: weekTotal,
         };
@@ -259,7 +193,7 @@ async function extractDailyFlowTable(page) {
     XLSX.utils.book_append_sheet(wb, wsDetail, "水文周报");
 
     const summaryRows = results.map((r) => ({
-      站码: r.站码, 站名: r.站名, 河流: r.河流, 站类: r.站类,
+      站码: r.站码, 站名: r.站名, 河流: r.河流,
       七日合计: r.七日合计, 周总量: r.周总量,
     }));
     const wsSummary = XLSX.utils.json_to_sheet(summaryRows);
