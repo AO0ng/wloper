@@ -3,7 +3,6 @@ const XLSX = require("xlsx");
 const path = require("path");
 const fs = require("fs");
 
-// ==================== 配置区 ====================
 const CONFIG = {
   referenceDate: "2026-06-09",
   stations: ["梓坊", "先锋", "土桥", "渣津", "瑞昌", "萍乡", "虬津"],
@@ -15,9 +14,7 @@ const CONFIG = {
 };
 
 const OUTPUT_DIR = path.join(__dirname, "output");
-const DEBUG_DIR = path.join(__dirname, "debug");
 
-// ==================== 日期工具 ====================
 function getWeekRange(refDateStr) {
   const ref = new Date(refDateStr + "T00:00:00");
   const dayOfWeek = ref.getDay();
@@ -46,153 +43,79 @@ function getWeekRange(refDateStr) {
   return { monday: fmt(lastMonday), sunday: fmt(lastSunday), dates };
 }
 
-// ==================== 调试截图 ====================
-async function debugShot(page, label) {
-  try {
-    fs.mkdirSync(DEBUG_DIR, { recursive: true });
-    const file = path.join(DEBUG_DIR, `${label}.png`);
-    await page.screenshot({ path: file, fullPage: true });
-    console.log(`  [截图] ${label}.png`);
-  } catch (_) {}
-}
-
 // ==================== 登录 ====================
 async function doLogin(page) {
+  console.log("  访问登录页...");
   await page.goto(CONFIG.loginUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.gotoTimeout });
-  await page.waitForTimeout(5000);
+  await page.waitForTimeout(3000);
 
-  let usernameInput = page.locator('input[name="username"]');
-  if (await usernameInput.count() === 0) {
-    usernameInput = page.locator('input:not([readonly]):not([type="password"]):visible').first();
-  }
+  await page.locator('input[name="username"]').fill(CONFIG.username);
+  await page.waitForTimeout(300);
+  await page.locator('input[name="password"]').fill(CONFIG.password);
+  await page.waitForTimeout(300);
 
-  let passwordInput = page.locator('input[name="password"]');
-  if (await passwordInput.count() === 0) {
-    passwordInput = page.locator('input[type="password"]:visible').first();
-  }
-
-  const uc = await usernameInput.count();
-  const pc = await passwordInput.count();
-  console.log(`  用户名框: ${uc}, 密码框: ${pc}`);
-
-  if (uc === 0 || pc === 0) {
-    await debugShot(page, "login-fail");
-    return false;
-  }
-
-  await usernameInput.fill(CONFIG.username);
-  await passwordInput.fill(CONFIG.password);
-
-  const loginBtn = page.locator('a:has-text("登 录"), button:has-text("登录"), button:has-text("登 录")');
+  const loginBtn = page.locator('a:has-text("登 录")').first();
   if (await loginBtn.count() > 0) {
-    await loginBtn.first().click();
+    await loginBtn.click({ force: true });
+    console.log("  点击登录");
   } else {
-    await passwordInput.press("Enter");
+    await page.locator('input[name="password"]').press("Enter");
   }
   await page.waitForTimeout(5000);
   return true;
 }
 
 // ==================== 数据提取 ====================
-async function extractStationData(page) {
-  // 先打印页面关键信息帮助调试
-  const info = await page.evaluate(() => {
-    const bodyText = (document.body.textContent || "").replace(/\s+/g, " ").substring(0, 500);
-    const views = document.querySelectorAll("[data-boundview]");
-    const viewInfo = [];
-    for (const v of views) {
-      const id = v.getAttribute("data-boundview");
-      const gridItems = v.querySelectorAll(".x-grid-item").length;
-      const headers = v.querySelectorAll(".x-column-header-text-inner, .x-column-header-text").length;
-      viewInfo.push({ id, gridItems, headers });
-    }
-    const totalGridItems = document.querySelectorAll(".x-grid-item").length;
-    const totalTables = document.querySelectorAll("table").length;
-    return { bodyPreview: bodyText, viewInfo, totalGridItems, totalTables };
-  });
+async function extractAllData(page) {
+  return await page.evaluate(() => {
+    const allRows = document.querySelectorAll(".x-grid-item");
+    const stationRows = [];  // 8-cell: 站码、站名、河流、月均值
+    const flowRows = [];     // 30-cell: 1日~30日流量
 
-  console.log(`  body前500字: ${info.bodyPreview}`);
-  console.log(`  .x-grid-item 总数: ${info.totalGridItems}`);
-  console.log(`  table 总数: ${info.totalTables}`);
-  for (const v of info.viewInfo) {
-    console.log(`  [data-boundview="${v.id}"]: ${v.gridItems} items, ${v.headers} headers`);
-  }
-
-  // 提取
-  const result = await page.evaluate(() => {
-    const results = [];
-    const views = document.querySelectorAll("[data-boundview]");
-    let targetView = null;
-    for (const v of views) {
-      const headers = v.querySelectorAll(".x-column-header-text-inner, .x-column-header-text");
-      if (headers.length >= 30) {
-        targetView = v;
-        break;
-      }
-    }
-    if (!targetView) {
-      targetView = document.querySelector('[data-boundview="tableview-1275"]');
-    }
-    if (!targetView) return { results, error: "无匹配 data view" };
-
-    const headerEls = targetView.querySelectorAll(".x-column-header-text-inner, .x-column-header-text");
-    const headers = [];
-    for (const h of headerEls) headers.push((h.textContent || "").trim());
-
-    const stationNameIdx = headers.findIndex(h => h === "站名" || h.includes("站名"));
-    const stationCodeIdx = headers.findIndex(h => h === "站码" || h.includes("站码"));
-    const riverIdx = headers.findIndex(h => h === "河流" || h.includes("河"));
-    const day1Idx = headers.findIndex(h => h === "1日" || h === "1");
-
-    const rows = targetView.querySelectorAll(".x-grid-item");
-    for (const row of rows) {
+    for (let idx = 0; idx < allRows.length; idx++) {
+      const row = allRows[idx];
       const cells = row.querySelectorAll(".x-grid-cell-inner");
       const texts = [];
       for (const cell of cells) texts.push((cell.textContent || "").trim());
-      if (texts.length < 3) continue;
+      const recordIndex = parseInt(row.getAttribute("data-recordindex")) || -1;
 
-      const stationCode = stationCodeIdx >= 0 ? texts[stationCodeIdx] : texts[2] || "";
-      const stationName = stationNameIdx >= 0 ? texts[stationNameIdx] : texts[3] || "";
-      const riverName = riverIdx >= 0 ? texts[riverIdx] : texts[4] || "";
-
-      if (!/^\d+$/.test(stationCode)) continue;
-
-      const dailyFlows = [];
-      const startCol = day1Idx >= 0 ? day1Idx : 8;
-      for (let i = startCol; i < texts.length; i++) {
-        const val = parseFloat(texts[i]);
-        if (!isNaN(val)) dailyFlows.push({ day: i - startCol + 1, flow: val });
+      if (texts.length === 8) {
+        // 站点信息行: [0]=空 [1]=序号 [2]=站码 [3]=站名 [4]=河流 [5]=月平均 [6]=月最大 [7]=月最小
+        stationRows.push({
+          recordIndex,
+          stationCode: texts[2],
+          stationName: texts[3],
+          riverName: texts[4],
+          monthAvg: parseFloat(texts[5]) || 0,
+        });
+      } else if (texts.length === 30) {
+        // 逐日流量行: [0]=1日 [1]=2日 ... [29]=30日
+        const flows = texts.map(t => {
+          if (t === "-" || t === "") return null;
+          const v = parseFloat(t);
+          return isNaN(v) ? null : v;
+        });
+        flowRows.push({ recordIndex, flows });
       }
-      results.push({ stationCode, stationName, riverName, dailyFlows });
     }
 
-    return {
-      results,
-      debug: {
-        viewId: targetView.getAttribute("data-boundview"),
-        headerCount: headers.length,
-        headers: headers.slice(0, 40),
-        stationNameIdx, stationCodeIdx, riverIdx, day1Idx,
-        rowCount: results.length,
-        firstRow: results.length > 0 ? results[0] : null,
-      }
-    };
+    return { stationRows, flowRows };
   });
-
-  return result;
 }
 
 // ==================== 主流程 ====================
 (async () => {
   const week = getWeekRange(CONFIG.referenceDate);
-  console.log(`=== 水文周报抓取 ===`);
+
+  console.log("=".repeat(50));
+  console.log("  水文数据周报抓取工具");
+  console.log("=".repeat(50));
   console.log(`基准日期: ${CONFIG.referenceDate}`);
   console.log(`抓取周期: ${week.monday} ~ ${week.sunday}`);
   console.log(`目标站点: ${CONFIG.stations.join(", ")}`);
   console.log("");
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-  fs.mkdirSync(DEBUG_DIR, { recursive: true });
 
   const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
   const context = await browser.newContext({ locale: "zh-CN", viewport: { width: 1920, height: 1080 } });
@@ -201,121 +124,95 @@ async function extractStationData(page) {
   try {
     // [1] 登录
     console.log("[1/4] 登录...");
-    const loggedIn = await doLogin(page);
-    if (!loggedIn) {
-      console.log("  登录失败，查看 debug/login-fail.png");
-      return;
-    }
+    if (!await doLogin(page)) { console.log("  登录失败"); return; }
     console.log("  ✓ 登录完成");
 
-    // [2] 进入数据视图并点击菜单
+    // [2] 进入数据页面
     console.log("[2/4] 进入逐日平均流量统计...");
     await page.goto(CONFIG.dataUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.gotoTimeout });
     await page.waitForTimeout(5000);
 
-    // 等左侧菜单
-    try { await page.waitForSelector(".x-treelist-item-text", { timeout: 15000 }); } catch (_) {}
-    await page.waitForTimeout(2000);
-
-    const treeItems = await page.$$(".x-treelist-item-text");
-    console.log(`  树菜单项: ${treeItems.length}`);
-    for (const item of treeItems) {
-      const text = (await item.textContent()).trim();
-      if (text.includes("逐日平均流量")) {
-        await item.click();
-        console.log(`  点击了: ${text}`);
-        break;
+    const menuClicked = await page.evaluate(() => {
+      const items = document.querySelectorAll(".x-treelist-item-text, .x-treelist-item");
+      for (const item of items) {
+        if ((item.textContent || "").includes("逐日平均流量")) { item.click(); return true; }
       }
-    }
+      return false;
+    });
+    console.log(menuClicked ? "  点击菜单: 逐日平均流量统计" : "  ⚠ 未找到菜单");
 
-    // 等待数据渲染 — 多次重试
+    // 等待数据
     console.log("  等待数据加载...");
-    let gridReady = false;
-    for (let retry = 0; retry < 6; retry++) {
-      await page.waitForTimeout(5000);
+    for (let i = 0; i < 6; i++) {
+      await page.waitForTimeout(4000);
       const count = await page.locator(".x-grid-item").count();
-      console.log(`    第${retry + 1}次检查: ${count} 个 .x-grid-item`);
-      if (count > 0) { gridReady = true; break; }
-      // 试试点击查询按钮
-      const queryBtn = page.locator('a:has-text("查询"), button:has-text("查询"), span:has-text("查询")').first();
-      if (await queryBtn.count() > 0 && retry === 2) {
-        console.log("    尝试点击查询按钮...");
-        await queryBtn.click();
-      }
+      console.log(`    轮次${i + 1}: ${count} 行`);
+      if (count > 50) break;
     }
 
-    await debugShot(page, "data-page");
-    console.log(`  grid就绪: ${gridReady}`);
-
-    if (!gridReady) {
-      // 保存HTML用于分析
-      const html = await page.content();
-      fs.writeFileSync(path.join(DEBUG_DIR, "data-page.html"), html);
-      console.log("  HTML已保存到 debug/data-page.html");
-    }
-
-    // [3] 提取站点数据
+    // [3] 提取
     console.log("[3/4] 提取站点数据...");
-    const { results: allData, debug } = await extractStationData(page);
+    const { stationRows, flowRows } = await extractAllData(page);
+    console.log(`  站点行: ${stationRows.length}, 流量行: ${flowRows.length}`);
 
-    if (debug) {
-      console.log(`  [调试] viewId: ${debug.viewId}, 表头${debug.headerCount}列`);
-      console.log(`  [调试] 站码@${debug.stationCodeIdx} 站名@${debug.stationNameIdx} 河流@${debug.riverIdx} 1日@${debug.day1Idx}`);
-      if (debug.headers.length > 0) {
-        console.log(`  [调试] 表头: ${debug.headers.join(" | ")}`);
-      }
-      if (debug.firstRow) {
-        console.log(`  [调试] 首行: ${debug.firstRow.stationCode} ${debug.firstRow.stationName} 流量${debug.firstRow.dailyFlows.length}天`);
-      }
-    }
-
-    console.log(`  共提取 ${allData.length} 条记录`);
+    // 按 recordIndex 建立映射
+    const flowMap = new Map();
+    for (const f of flowRows) flowMap.set(f.recordIndex, f.flows);
 
     const stationMap = new Map();
-    for (const data of allData) {
-      if (data.stationName) stationMap.set(data.stationName, data);
+    for (const s of stationRows) {
+      const flows = flowMap.get(s.recordIndex) || [];
+      stationMap.set(s.stationName, { ...s, dailyFlows: flows });
     }
     console.log(`  共 ${stationMap.size} 个不同站点`);
+    const sampleNames = [...stationMap.keys()].slice(0, 10);
+    console.log(`  可用站名(前10): ${sampleNames.join(", ")}`);
 
-    if (stationMap.size > 0) {
-      console.log(`  可用站名(前20): ${[...stationMap.keys()].slice(0, 20).join(", ")}`);
-    }
-
-    // [4] 匹配站点 & 计算周总量 & 导出 Excel
+    // [4] 匹配 & 导出
     console.log("[4/4] 匹配站点、计算周总量...");
+    const startDay = parseInt(week.dates[0].split("-")[2]); // 周一的日
+    const endDay = parseInt(week.dates[6].split("-")[2]);   // 周日的日
     const results = [];
 
     for (const stationName of CONFIG.stations) {
-      const data = stationMap.get(stationName);
-      if (data) {
-        const flowSum = data.dailyFlows.reduce((s, f) => s + f.flow, 0);
-        const weekTotal = Math.round(flowSum * 86400 / 10000 * 100) / 100;
+      const s = stationMap.get(stationName);
+      if (!s) { console.log(`  ✗ ${stationName}: 未找到`); continue; }
 
-        const row = {
-          站码: data.stationCode,
-          站名: data.stationName,
-          河流: data.riverName,
-          七日合计: Math.round(flowSum * 100) / 100,
-          周总量: weekTotal,
-        };
-
-        for (let i = 0; i < 7 && i < data.dailyFlows.length; i++) {
-          row[week.dates[i]] = data.dailyFlows[i].flow;
+      // 取上周对应日期的流量 (日索引 = 日-1)
+      let flowSum = 0;
+      let dayCount = 0;
+      const detail = {};
+      for (let d = startDay; d <= endDay; d++) {
+        const flow = s.dailyFlows[d - 1]; // 数组索引
+        detail[week.dates[dayCount]] = flow;
+        if (flow !== null && flow !== undefined) {
+          flowSum += flow;
+          dayCount++;
         }
-
-        results.push(row);
-        console.log(`  ✓ ${stationName} 日均${Math.round(flowSum / 7 * 100) / 100} m³/s  周总量${weekTotal}万m³`);
-      } else {
-        console.log(`  ✗ ${stationName}: 未找到`);
       }
+
+      if (dayCount === 0) { console.log(`  ✗ ${stationName}: 无流量数据`); continue; }
+
+      const weekTotal = Math.round(flowSum * 86400 / 10000 * 100) / 100;
+      const row = {
+        站码: s.stationCode,
+        站名: s.stationName,
+        河流: s.riverName,
+        七日合计: Math.round(flowSum * 100) / 100,
+        周总量: weekTotal,
+      };
+      Object.assign(row, detail);
+
+      results.push(row);
+      console.log(`  ✓ ${stationName} 日均${Math.round(flowSum / dayCount * 100) / 100} m³/s  周总量${weekTotal}万m³`);
     }
 
     if (results.length === 0) {
       console.log("\n⚠ 未匹配到任何站点。");
-      console.log("  请查看 debug/data-page.png 截图和 debug/data-page.html。");
       return;
     }
 
+    // 导出 Excel
     const filename = `水文周报_${week.monday}_${week.sunday}.xlsx`;
     const filepath = path.join(OUTPUT_DIR, filename);
 
@@ -323,15 +220,13 @@ async function extractStationData(page) {
     const wsDetail = XLSX.utils.json_to_sheet(results);
     XLSX.utils.book_append_sheet(wb, wsDetail, "水文周报");
 
-    const summaryRows = results.map((r) => ({
+    const summaryRows = results.map(r => ({
       站码: r.站码, 站名: r.站名, 河流: r.河流,
       七日合计: r.七日合计, 周总量: r.周总量,
     }));
-    const wsSummary = XLSX.utils.json_to_sheet(summaryRows);
-    XLSX.utils.book_append_sheet(wb, wsSummary, "汇总");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), "汇总");
 
     XLSX.writeFile(wb, filepath);
-
     console.log(`\n✅ 导出完成: ${filepath}`);
     console.log(`   站点: ${results.length}/${CONFIG.stations.length}`);
   } catch (err) {
