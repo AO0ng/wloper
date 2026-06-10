@@ -45,18 +45,55 @@ function getWeekRange(refDateStr) {
   return { monday: fmt(lastMonday), sunday: fmt(lastSunday), dates };
 }
 
+// ==================== 登录 ====================
+async function doLogin(page) {
+  await page.goto(CONFIG.loginUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.gotoTimeout });
+  await page.waitForTimeout(5000);
+
+  // 登录页面是 ExtJS 构建的，输入框可能是 ExtJS 组件
+  // 尝试多种方式找到用户名和密码输入框
+  let usernameInput = page.locator('input[name="username"]');
+  if (await usernameInput.count() === 0) {
+    // 找可见的、可编辑的、非密码的 input
+    usernameInput = page.locator('input:not([readonly]):not([type="password"]):visible').first();
+  }
+
+  let passwordInput = page.locator('input[name="password"]');
+  if (await passwordInput.count() === 0) {
+    passwordInput = page.locator('input[type="password"]:visible').first();
+  }
+
+  const uc = await usernameInput.count();
+  const pc = await passwordInput.count();
+  console.log(`  找到用户名框: ${uc}, 密码框: ${pc}`);
+
+  if (uc === 0 || pc === 0) {
+    console.log("  ⚠ 未找到登录输入框，尝试截图保存...");
+    await page.screenshot({ path: path.join(OUTPUT_DIR, "login-page.png"), fullPage: true });
+    return false;
+  }
+
+  await usernameInput.fill(CONFIG.username);
+  await passwordInput.fill(CONFIG.password);
+
+  const loginBtn = page.locator('a:has-text("登 录"), button:has-text("登录"), button:has-text("登 录")');
+  if (await loginBtn.count() > 0) {
+    await loginBtn.first().click();
+  } else {
+    await passwordInput.press("Enter");
+  }
+  await page.waitForTimeout(5000);
+  return true;
+}
+
 // ==================== 数据提取 ====================
 async function extractStationData(page) {
-  // 页面是 ExtJS 构建，数据在 [data-boundview="tableview-1275"] 中
-  // 列结构（有 checkbox 列占位）:
-  //   □(0) | 行号(1) | 站码(2) | 站名(3) | 河流(4) | 月平均(5) | 月最大(6) | 月最小(7) | 1日(8) | 2日(9) | ... | 31日(38)
   const result = await page.evaluate(() => {
     const results = [];
-    // 目标：逐日平均流量统计的 grid view
+    // 找包含大量列（>=30）的 data view — 即有1日~31日列的
     const views = document.querySelectorAll("[data-boundview]");
     let targetView = null;
     for (const v of views) {
-      // 找包含大量列（>30列）的 view，即有1日~31日列的
       const headers = v.querySelectorAll(".x-column-header-text-inner, .x-column-header-text");
       if (headers.length >= 30) {
         targetView = v;
@@ -64,26 +101,25 @@ async function extractStationData(page) {
       }
     }
     if (!targetView) {
-      // 回退到 tableview-1275
       targetView = document.querySelector('[data-boundview="tableview-1275"]');
     }
     if (!targetView) {
       return { results, error: "未找到数据 grid view" };
     }
 
-    // 提取表头确认列索引
+    // 提取表头
     const headerEls = targetView.querySelectorAll(".x-column-header-text-inner, .x-column-header-text");
     const headers = [];
     for (const h of headerEls) {
       headers.push((h.textContent || "").trim());
     }
-    // 找到站名列和1日列的位置
+
     const stationNameIdx = headers.findIndex(h => h === "站名" || h.includes("站名"));
     const stationCodeIdx = headers.findIndex(h => h === "站码" || h.includes("站码"));
     const riverIdx = headers.findIndex(h => h === "河流" || h.includes("河"));
     const day1Idx = headers.findIndex(h => h === "1日" || h === "1");
 
-    // 提取数据行（跳过表头）
+    // 提取数据行
     const rows = targetView.querySelectorAll(".x-grid-item");
     for (const row of rows) {
       const cells = row.querySelectorAll(".x-grid-cell-inner");
@@ -97,7 +133,6 @@ async function extractStationData(page) {
       const stationName = stationNameIdx >= 0 ? (texts[stationNameIdx] || "") : (texts[3] || "");
       const riverName = riverIdx >= 0 ? (texts[riverIdx] || "") : (texts[4] || "");
 
-      // 跳过无效行：站码应为纯数字
       if (!/^\d+$/.test(stationCode)) continue;
 
       const dailyFlows = [];
@@ -112,20 +147,17 @@ async function extractStationData(page) {
       results.push({ stationCode, stationName, riverName, dailyFlows });
     }
 
-    // 附赠调试信息
-    const debug = {
-      viewId: targetView.getAttribute("data-boundview"),
-      headerCount: headers.length,
-      headers: headers.slice(0, 40),
-      stationNameIdx,
-      stationCodeIdx,
-      riverIdx,
-      day1Idx,
-      rowCount: results.length,
-      firstRow: results.length > 0 ? results[0] : null,
+    return {
+      results,
+      debug: {
+        viewId: targetView.getAttribute("data-boundview"),
+        headerCount: headers.length,
+        headers: headers.slice(0, 40),
+        stationNameIdx, stationCodeIdx, riverIdx, day1Idx,
+        rowCount: results.length,
+        firstRow: results.length > 0 ? results[0] : null,
+      }
     };
-
-    return { results, debug };
   });
 
   return result;
@@ -149,23 +181,10 @@ async function extractStationData(page) {
   try {
     // [1] 登录
     console.log("[1/4] 登录...");
-    await page.goto(CONFIG.loginUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.gotoTimeout });
-    await page.waitForTimeout(3000);
-
-    // 正确的登录选择器：用户名输入框
-    const usernameInput = page.locator('input[name="username"], input[type="text"]').first();
-    const passwordInput = page.locator('input[name="password"], input[type="password"]').first();
-    const loginBtn = page.locator('a:has-text("登 录"), button:has-text("登录"), button:has-text("登 录")');
-
-    if (await usernameInput.count() > 0) {
-      await usernameInput.fill(CONFIG.username);
-      await passwordInput.fill(CONFIG.password);
-      if (await loginBtn.count() > 0) {
-        await loginBtn.first().click();
-      } else {
-        await passwordInput.press("Enter");
-      }
-      await page.waitForTimeout(4000);
+    const loggedIn = await doLogin(page);
+    if (!loggedIn) {
+      console.log("  登录失败，请查看 output/login-page.png");
+      return;
     }
     console.log("  ✓ 登录完成");
 
@@ -174,7 +193,6 @@ async function extractStationData(page) {
     await page.goto(CONFIG.dataUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.gotoTimeout });
     await page.waitForTimeout(3000);
 
-    // 等待左侧树菜单加载
     await page.waitForSelector(".x-treelist-item-text", { timeout: 15000 }).catch(() => {});
     await page.waitForTimeout(2000);
 
@@ -192,14 +210,12 @@ async function extractStationData(page) {
       await page.locator('text="逐日平均流量统计"').first().click();
     }
 
-    // 等待数据 grid 加载
     console.log("  等待数据加载...");
     await page.waitForTimeout(5000);
-    // 等待 .x-grid-item 出现
     try {
       await page.waitForSelector(".x-grid-item", { timeout: 15000 });
     } catch (_) {
-      console.log("  ⚠ .x-grid-item 未出现，尝试继续...");
+      console.log("  ⚠ .x-grid-item 未出现");
     }
     await page.waitForTimeout(3000);
     console.log("  ✓ 菜单已点击");
@@ -209,8 +225,8 @@ async function extractStationData(page) {
     const { results: allData, debug } = await extractStationData(page);
 
     if (debug) {
-      console.log(`  [调试] viewId: ${debug.viewId}, 表头: ${debug.headerCount}列`);
-      console.log(`  [调试] 站码@${debug.stationCodeIdx}, 站名@${debug.stationNameIdx}, 河流@${debug.riverIdx}, 1日@${debug.day1Idx}`);
+      console.log(`  [调试] viewId: ${debug.viewId}, 表头${debug.headerCount}列`);
+      console.log(`  [调试] 站码@${debug.stationCodeIdx} 站名@${debug.stationNameIdx} 河流@${debug.riverIdx} 1日@${debug.day1Idx}`);
       console.log(`  [调试] 表头: ${(debug.headers || []).join(" | ")}`);
       if (debug.firstRow) {
         console.log(`  [调试] 首行: ${debug.firstRow.stationCode} ${debug.firstRow.stationName} 流量${debug.firstRow.dailyFlows.length}天`);
@@ -219,7 +235,6 @@ async function extractStationData(page) {
 
     console.log(`  共提取 ${allData.length} 条记录`);
 
-    // 建立站名索引
     const stationMap = new Map();
     for (const data of allData) {
       if (data.stationName) stationMap.set(data.stationName, data);
@@ -265,12 +280,10 @@ async function extractStationData(page) {
       return;
     }
 
-    // 导出 Excel
     const filename = `水文周报_${week.monday}_${week.sunday}.xlsx`;
     const filepath = path.join(OUTPUT_DIR, filename);
 
     const wb = XLSX.utils.book_new();
-
     const wsDetail = XLSX.utils.json_to_sheet(results);
     XLSX.utils.book_append_sheet(wb, wsDetail, "水文周报");
 
