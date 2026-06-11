@@ -4,8 +4,8 @@ const path = require("path");
 const fs = require("fs");
 
 const CONFIG = {
-  referenceDate: "2026-05-13",
-  stations: ["梓坊", "先锋", "土桥", "渣津", "瑞昌", "萍乡", "三百山"],
+  referenceDate: "",
+  stations: ["先锋", "渣津", "梓坊", "瑞昌", "土桥", "界上", "八门"],
   gotoTimeout: 60000,
   loginUrl: "http://weixin.jxsswj.cn/jxhydp-app/#login",
   dataUrl: "http://weixin.jxsswj.cn/jxhydp-app/#hydataview",
@@ -152,12 +152,13 @@ async function extractFromStore(page) {
 }
 
 (async () => {
-  const week = getWeekRange(CONFIG.referenceDate);
+  const effectiveRefDate = CONFIG.referenceDate || new Date().toISOString().split("T")[0];
+  const week = getWeekRange(effectiveRefDate);
 
   console.log("=".repeat(50));
   console.log("  水文数据周报抓取工具");
   console.log("=".repeat(50));
-  console.log(`基准日期: ${CONFIG.referenceDate}`);
+  console.log(`基准日期: ${effectiveRefDate}`);
   console.log(`抓取周期: ${week.monday} ~ ${week.sunday}`);
   console.log(`目标年月: ${week.targetYear}年${week.targetMonth}月`);
   console.log(`目标站点: ${CONFIG.stations.join(", ")}`);
