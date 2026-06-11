@@ -40,10 +40,15 @@ function getWeekRange(refDateStr) {
     dates.push(fmt(d));
   }
 
-  return { monday: fmt(lastMonday), sunday: fmt(lastSunday), dates };
+  return {
+    monday: fmt(lastMonday),
+    sunday: fmt(lastSunday),
+    dates,
+    targetYear: lastMonday.getFullYear(),
+    targetMonth: lastMonday.getMonth() + 1,
+  };
 }
 
-// ==================== 登录 ====================
 async function doLogin(page) {
   await page.goto(CONFIG.loginUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.gotoTimeout });
   await page.waitForTimeout(3000);
@@ -61,10 +66,63 @@ async function doLogin(page) {
   return true;
 }
 
-// ==================== 通过 ExtJS Store API 提取全部数据 ====================
+async function switchMonth(page, year, month) {
+  console.log(`  切换年月: ${year}年${month}月...`);
+
+  // 1. 设置年份 (ExtJS API)
+  await page.evaluate((yr) => {
+    const combo = window.Ext.ComponentQuery.query('combobox#combo-1031')[0];
+    if (combo) combo.setValue(yr);
+  }, year);
+
+  // 2. 点击月份 combo 展开下拉 (Playwright DOM)
+  await page.locator('#combo-1225-inputEl').click();
+  await page.waitForTimeout(800);
+
+  // 3. 点击目标月份
+  const targetText = `${month}月`;
+  await page.locator(`.x-boundlist-item:has-text("${targetText}")`).click();
+  await page.waitForTimeout(500);
+
+  // 4. 用 ExtJS fireEvent 触发查询按钮
+  await page.evaluate(() => {
+    const btn = window.Ext.ComponentQuery.query('button#button-1229')[0];
+    if (btn) btn.fireEvent('click');
+  });
+  console.log("  点击查询");
+
+  // 5. 等待 grid 重新加载
+  await page.waitForTimeout(10000);
+
+  // 6. 验证
+  const info = await page.evaluate(() => {
+    const grid = window.Ext.ComponentQuery.query('grid#grid-1232')[0];
+    if (!grid) return { error: true };
+    const store = grid.getStore();
+    const r0 = store.getAt(0);
+    return {
+      total: store.getCount(),
+      yr: r0 ? r0.data.yr : null,
+      month: r0 ? r0.data.month : null,
+    };
+  });
+
+  if (info.error) {
+    console.log("  ✗ grid未找到");
+    return false;
+  }
+
+  if (info.yr !== year || info.month !== month) {
+    console.log(`  ⚠ 期望 ${year}/${month}，实际 ${info.yr}/${info.month}（继续执行）`);
+  } else {
+    console.log(`  ✓ 已切换到 ${info.yr}年${info.month}月，${info.total}条记录`);
+  }
+  return true;
+}
+
 async function extractFromStore(page) {
   return await page.evaluate((targetStations) => {
-    const grid = window.Ext.ComponentQuery.query("grid#grid-1232")[0];
+    const grid = window.Ext.ComponentQuery.query('grid#grid-1232')[0];
     if (!grid) return { error: "grid-1232 未找到" };
 
     const store = grid.getStore();
@@ -73,8 +131,9 @@ async function extractFromStore(page) {
 
     for (const name of targetStations) {
       const idx = store.find("stnm", name);
-      if (idx < 0) {
-        // 模糊匹配
+      if (idx >= 0) {
+        results.push({ stationName: name, data: store.getAt(idx).data, index: idx });
+      } else {
         let found = false;
         for (let i = 0; i < total; i++) {
           const rec = store.getAt(i);
@@ -85,9 +144,6 @@ async function extractFromStore(page) {
           }
         }
         if (!found) results.push({ stationName: name, data: null, index: -1 });
-      } else {
-        const rec = store.getAt(idx);
-        results.push({ stationName: name, data: rec.data, index: idx });
       }
     }
 
@@ -95,7 +151,6 @@ async function extractFromStore(page) {
   }, CONFIG.stations);
 }
 
-// ==================== 主流程 ====================
 (async () => {
   const week = getWeekRange(CONFIG.referenceDate);
 
@@ -104,6 +159,7 @@ async function extractFromStore(page) {
   console.log("=".repeat(50));
   console.log(`基准日期: ${CONFIG.referenceDate}`);
   console.log(`抓取周期: ${week.monday} ~ ${week.sunday}`);
+  console.log(`目标年月: ${week.targetYear}年${week.targetMonth}月`);
   console.log(`目标站点: ${CONFIG.stations.join(", ")}`);
   console.log("");
 
@@ -114,13 +170,11 @@ async function extractFromStore(page) {
   const page = await context.newPage();
 
   try {
-    // [1] 登录
-    console.log("[1/3] 登录...");
+    console.log("[1/4] 登录...");
     if (!await doLogin(page)) { console.log("  登录失败"); return; }
     console.log("  ✓ 登录完成");
 
-    // [2] 进入数据页面并提取
-    console.log("[2/3] 进入逐日平均流量统计...");
+    console.log("[2/4] 进入逐日平均流量统计...");
     await page.goto(CONFIG.dataUrl, { waitUntil: "domcontentloaded", timeout: CONFIG.gotoTimeout });
     await page.waitForTimeout(5000);
 
@@ -133,13 +187,12 @@ async function extractFromStore(page) {
     });
     if (!menuClicked) { console.log("  ⚠ 未找到菜单"); return; }
     console.log("  点击菜单: 逐日平均流量统计");
+    await page.waitForTimeout(5000);
 
-    // 等待 grid store 加载
-    console.log("  等待数据...");
-    await page.waitForTimeout(8000);
+    console.log("[3/4] 切换年月...");
+    await switchMonth(page, week.targetYear, week.targetMonth);
 
-    // 通过 ExtJS API 提取
-    console.log("[3/3] 提取并计算...");
+    console.log("[4/4] 提取并计算...");
     const { total, results: storeResults, error } = await extractFromStore(page);
     if (error) { console.log(`  ✗ ${error}`); return; }
     console.log(`  Store 总记录: ${total}`);
@@ -155,25 +208,9 @@ async function extractFromStore(page) {
       }
 
       const d = sr.data;
-      let flowSum = 0;
-      let dayCount = 0;
-      const detail = {};
-
-      for (let day = startDay; day <= endDay; day++) {
-        const key = `dq${day}`;
-        const val = d[key];
-        const flow = (val !== undefined && val !== null && val !== "") ? parseFloat(val) : null;
-        detail[week.dates[dayCount]] = flow;
-        if (flow !== null && !isNaN(flow)) {
-          flowSum += flow;
-          dayCount++;
-        }
-        dayCount = Math.max(dayCount, 0); // keep count correct
-      }
-
-      // 重新计数
       let actualSum = 0;
       let actualDays = 0;
+
       for (let day = startDay; day <= endDay; day++) {
         const val = d[`dq${day}`];
         const flow = (val !== undefined && val !== null && val !== "") ? parseFloat(val) : null;
@@ -193,8 +230,6 @@ async function extractFromStore(page) {
       const row = {
         站码: d.stcd,
         站名: d.stnm,
-        河流: d.rvnm,
-        管理单位: d.admsnm,
         七日合计: Math.round(actualSum * 100) / 100,
         周总量: weekTotal,
       };
@@ -213,7 +248,6 @@ async function extractFromStore(page) {
       return;
     }
 
-    // 导出 Excel
     const filename = `水文周报_${week.monday}_${week.sunday}.xlsx`;
     const filepath = path.join(OUTPUT_DIR, filename);
 
@@ -221,7 +255,7 @@ async function extractFromStore(page) {
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(excelRows), "水文周报");
 
     const summaryRows = excelRows.map(r => ({
-      站码: r.站码, 站名: r.站名, 河流: r.河流, 管理单位: r.管理单位,
+      站码: r.站码, 站名: r.站名,
       七日合计: r.七日合计, 周总量: r.周总量,
     }));
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), "汇总");
@@ -238,3 +272,5 @@ async function extractFromStore(page) {
     console.log("\n浏览器已关闭");
   }
 })();
+
+
