@@ -4,8 +4,8 @@ const path = require("path");
 const fs = require("fs");
 
 const CONFIG = {
-  referenceDate: "2026-06-09",
-  stations: ["梓坊", "先锋", "土桥", "渣津", "瑞昌", "萍乡", "虬津"],
+  referenceDate: "2026-05-13",
+  stations: ["梓坊", "先锋", "土桥", "渣津", "瑞昌", "萍乡", "三百山"],
   gotoTimeout: 60000,
   loginUrl: "http://weixin.jxsswj.cn/jxhydp-app/#login",
   dataUrl: "http://weixin.jxsswj.cn/jxhydp-app/#hydataview",
@@ -225,7 +225,7 @@ async function extractFromStore(page) {
         continue;
       }
 
-      const weekTotal = Math.round(actualSum * 86400 / 10000 * 100) / 100;
+      const weekTotal = Math.round(actualSum * 86400 / 1000000 * 100) / 100;
 
       const row = {
         站码: d.stcd,
@@ -240,7 +240,7 @@ async function extractFromStore(page) {
       }
 
       excelRows.push(row);
-      console.log(`  ✓ ${sr.stationName}(${d.stcd}) 日均${Math.round(actualSum / actualDays * 100) / 100} m³/s  周总量${weekTotal}万m³`);
+      console.log(`  ✓ ${sr.stationName}(${d.stcd}) 日均${Math.round(actualSum / actualDays * 100) / 100} m³/s  周总量${weekTotal}百万m³`);
     }
 
     if (excelRows.length === 0) {
@@ -272,5 +272,6 @@ async function extractFromStore(page) {
     console.log("\n浏览器已关闭");
   }
 })();
+
 
 
